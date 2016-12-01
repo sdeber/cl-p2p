@@ -1,0 +1,255 @@
+(require :ironclad)
+(defun ntoh (buffer)
+  (loop with result = 0
+     for x across buffer
+     and y = 0 then (+ y 8)
+     do
+     (setf (ldb (byte 8 y) result) x)
+     finally (return result)))
+
+(defun hton (num)
+  (make-array 2 :element-type '(unsigned-byte 8)
+	      :initial-contents (list (ldb (byte 8 0) num)
+				      (ldb (byte 8 8) num))))
+
+(defun initialize (ip id &optional (port 7000))
+  (let* ((node (make-instance 'chord-node)))
+    (update-fingertable node (make-instance 'node
+			      :id (ironclad:digest-file :sha1 id)
+			      :ip ip
+			      :port (hton port)) 0)
+    (update-fingertable node (get-local node) 1)
+    (setf (get-predecessor node) (get-id node))
+    (sb-bsd-sockets:socket-bind (get-socket node) ip port)
+    node))
+
+(defun bytevector->bignum (v)
+  (loop with result = 0
+     for x across v
+     and y = 0 then (+ y 8)
+     do (setf  (ldb (byte 8 y) result) x)
+     finally (return result)))
+
+(defun calculate-distance (key id)
+  (mod (+ (bytevector->bignum id)
+	  (1+ (loop with result = 0
+		 for x across key
+		 and y = 0 then (+ y 8)
+		 do (setf  (ldb (byte 8 y) result) (lognot x))
+		 finally (return result))))
+       (expt 2 160)))
+
+(defmacro with-socket ((socketname type protocol) &body body)
+  `(let ((,socketname (make-instance
+		       'sb-bsd-sockets:inet-socket
+		       :type ,type :protocol ,protocol)))
+    ,@body
+    (sb-bsd-sockets:socket-close ,socketname)))
+
+(defclass node ()
+  ((id :accessor get-id
+       :initarg :id
+       :documentation
+       "identifier of a node, an array of type unsigned byte of 
+length 20")
+   (ip :accessor get-ip
+       :initarg :ip)
+   (port :accessor get-port
+	 :initarg :port
+	 :documentation "ports are represented by byte-arrays in network byte order.")))
+
+(defclass chord-node ()
+  ((fingertable :accessor get-fingertable
+		:initform (make-array 161)
+		:documentation "array(0) stores information about this node")
+   (predecessor :accessor get-predecessor
+		:initarg :predecessor
+		:initform nil)
+   (datapool :accessor get-datapool
+	     :initform (make-hash-table :test #'equal))
+   (socket :accessor get-socket
+	   :initform (make-instance
+		      'sb-bsd-sockets:inet-socket
+		      :type :datagram :protocol :udp))))
+
+(defvar *myself* (make-instance 'chord-node))
+
+(defmethod get-successor ((node chord-node))
+  (aref (get-fingertable node) 1))
+
+(defmethod get-id ((node chord-node))
+  (get-id (aref (get-fingertable node) 0)))
+
+(defmethod get-ip ((node chord-node))
+  (get-ip (aref (get-fingertable node) 0)))
+
+(defmethod get-port ((node chord-node))
+  (get-port (aref (get-fingertable node) 0)))
+
+(defmethod get-local ((node chord-node))
+  (aref (get-fingertable node) 0))
+
+(defmethod update-fingertable ((node chord-node) (table node) entry)
+  (let ((fingertable (get-fingertable node)))
+    (setf (aref fingertable entry) table)))
+
+(defclass message ()
+  ((type :accessor get-type
+	 :initarg :type
+	 :documentation ":search,:answer,:join,:failure,:predecessor,:quit,:notify")
+   (content :accessor get-content
+	    :initarg :content
+	    :documentation "it is a key")
+   (sender :accessor get-sender
+	   :initarg :sender)))
+
+(defmethod message->vector ((m message))
+  "Each quary is of length 47 bytes,it is orgnised as follows: 
+type(0,1 or 2) + key + sender's id + sender's ip + sender's port.
+For type 0, it is a search of data, so the key is the key of the data,
+for type 1, it is a answer to a search, the key is received from the 
+search, for type 2, it is a join-request, the sender uses its id as the
+key,type 3 means search failed."
+  (let ((type-array (make-array 1 :element-type '(unsigned-byte 8)))
+	(sender (get-sender m)))
+    (case (get-type m)
+      (:search (setf (aref type-array 0) 0))
+      (:answer (setf (aref type-array 0) 1))
+      (:join (setf (aref type-array 0) 2))
+      (:failure (setf (aref type-array 0) 3)))
+    (concatenate '(vector (unsigned-byte 8) *) 
+		 type-array
+		 (get-content m)
+		 (get-id sender) (get-ip sender) (get-port sender))))
+
+(defun vector->message (message-vector)
+  (let ((type-list (list :search :answer :join :failure :stablize :notify :quit))
+	(m (make-instance 'message))
+	(sender (make-instance 'node)))
+    (setf (get-type m) (nth (aref message-vector 0) type-list)
+	  (get-content m) (subseq message-vector 1 21)
+	  (get-id sender) (subseq message-vector 21 41)
+	  (get-ip sender) (subseq message-vector 41 45)
+	  (get-port sender) (subseq message-vector 45 47)
+	  (get-sender m) sender)
+    m))
+
+(defun create-message (sender-id sender-ip sender-port content type)
+  (make-instance 'message :type type
+			  :content content
+			  :sender (make-instance 'node :id sender-id
+						       :ip sender-ip
+						       :port (hton sender-port))))
+
+(defmethod send-message ((sender node) (destination node) content type)
+  (with-socket (sock :datagram :udp)
+    (let ((message (make-instance 'message
+				  :type type
+				  :content content
+				  :sender sender)))
+      (sb-bsd-sockets:socket-send sock (message->vector message) nil
+				  :address
+				  (list (get-ip destination)
+					(ntoh (get-port destination)))))))
+
+(defmethod send-and-get-reply ((node chord-node) content type known-ip &optional (port 7000))
+  (let ((reply (make-array 47 :element-type '(unsigned-byte 8))))
+    (with-socket (sock :datagram :udp)
+      (sb-bsd-sockets:socket-bind sock #(127 0 0 1) 9900)
+      (multiple-value-bind (local-ip local-port)
+	  (sb-bsd-sockets:socket-name sock)
+	(let ((message (create-message (get-id node)
+				     local-ip
+				     local-port
+				     content
+				     type))
+	      (reading (sb-thread:make-thread (lambda ()
+						(sb-bsd-sockets:socket-receive
+						 sock reply nil :element-type '(unsigned-byte 8))))))
+	  (sb-bsd-sockets:socket-send sock (message->vector message) nil :address (list known-ip port))
+	  (sb-thread:join-thread reading))))
+	(vector->message reply)))
+
+(defmethod find-closest-node ((node chord-node) key)
+  ;;find the node which is closest to the given key
+  ;;Currently, it just returns the successor.
+  (declare (ignore key))
+  (aref (get-fingertable node) 1))
+
+(defun lookup (key)
+  (let ((message (send-and-get-reply *myself* key :search
+				     (get-ip (get-successor *myself*))
+				     (get-port (get-successor *myself*)))))
+    (if (or (null message) (eql (get-type message) :failure))
+	;;search failed
+	nil
+	(get-sender message))))
+
+(defmethod forward-message ((m message))
+  (let ((dest-ip (get-ip (get-successor *myself*)))
+	(dest-port (get-port (get-successor *myself*)))
+	(message (message->vector m)))
+    (with-socket (sock :datagram :udp)
+      (sb-bsd-sockets:socket-send
+       sock message nil
+       :address (list dest-ip dest-port)))))
+
+(defmethod server ((node chord-node))
+  (labels ((process-search (message)
+	     (let* ((sender (get-sender message))
+		    (datapool (get-datapool node))
+		    (key (get-content message))
+		    (distance (calculate-distance key (get-id node))))
+	       (if (<= distance (calculate-distance key (get-id sender)))
+		   (let ((result (gethash key datapool)))
+		     (if (null result)
+			 (send-message (get-local node) sender key :failure)
+			 (send-message (get-local node) sender key :answer)))
+		   (forward-message message))))
+	   (search-successor (message)
+	     (let* ((successor (get-successor node))
+		    (predecessor (get-predecessor node))
+		    (d1 (calculate-distance (get-id (get-sender message)) (get-id successor)))
+		    (d2 (calculate-distance (get-id (get-sender message)) (get-id node)))
+		    (d3 (calculate-distance (get-id (get-sender message)) predecessor)))
+	       (if (and (<= d2 d1) (<= d2 d3))
+		   (progn (setf a message)
+		   ;;this node is your successor
+		   (send-message (get-local node) (get-sender message) (get-content message) :answer)
+		   (setf b 1))
+		   (forward-message message)))))
+  (let ((sock (get-socket node))
+	(message (make-array 47 :element-type '(unsigned-byte 8))))
+    (sb-thread:make-thread (lambda ()
+			     (loop 
+				for data = (sb-bsd-sockets:socket-receive sock message nil
+					   :element-type '(unsigned-byte 8)) 
+				then (sb-bsd-sockets:socket-receive sock message nil
+					   :element-type '(unsigned-byte 8))
+				do (let ((m (vector->message message)))
+				     (case (get-type m)
+				       (:search (process-search m))
+				       (:join (search-successor m))
+				       (:stablize (send-message (get-local node) (get-sender m)
+								(get-predecessor node) :answer))
+				       (:notify (let ((sender (bytevector->bignum (get-id (get-sender m))))
+						      (predecessor (bytevector->bignum (get-predecessor node)))
+						      (id (bytevector->bignum (get-id node))))
+						  (if (or (= predecessor id)
+							  (and (> sender predecessor)
+							       (< sender id)))
+						      (setf (get-predecessor node) sender))))))))))))
+
+(defmethod join ((node chord-node) known-ip &optional (port 7000))
+  (let ((message (send-and-get-reply node (get-id node) :join known-ip port)))
+    (if (null message)
+	;;failed
+	nil
+	(setf (aref (get-fingertable node) 1) (get-sender message)))))
+
+(defmethod stablize ((node chord-node))
+  (let ((message (send-and-get-reply node (get-id node) :stablize
+				     (get-ip (get-successor node))
+				     (ntoh (get-port (get-successor node))))))
+    (if (not (null message))
+	(if (and ())))))
